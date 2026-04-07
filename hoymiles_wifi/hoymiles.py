@@ -398,20 +398,40 @@ def get_dtu_model_type(serial_bytes: bytes) -> DTUType:
 
 
 def get_dtu_model_name(serial_number: str) -> str:
-    """Get DTU model name."""
+    """Get DTU model name while suppressing noisy errors for unknown DTUs."""
 
-    if serial_number[-1:] == "J":
-        serial_number = serial_number[:-1]
+    if not serial_number:
+        logger.debug("DTU serial number missing; returning 'Unknown'")
+        return "Unknown"
 
-    serial_bytes = bytes.fromhex(serial_number)
+    normalized_serial = (
+        serial_number[:-1] if serial_number.endswith("J") else serial_number
+    )
+
+    try:
+        serial_bytes = bytes.fromhex(normalized_serial)
+    except ValueError as err:
+        logger.debug(
+            "DTU serial %s is not a valid hex string; returning 'Unknown' (%s)",
+            serial_number,
+            err,
+        )
+        return "Unknown"
 
     try:
         dtu_type = get_dtu_model_type(serial_bytes)
-    except Exception as e:
-        logger.error(e)
+    except ValueError as err:
+        logger.debug(
+            "Unknown DTU prefix %s; returning 'Unknown' (%s)",
+            serial_bytes[:2],
+            err,
+        )
         return "Unknown"
-    else:
-        return dtu_type.value
+    except Exception as err:  # pragma: no cover - defensive fallback
+        logger.error("Unexpected error while decoding DTU %s: %s", serial_number, err)
+        return "Unknown"
+
+    return dtu_type.value
 
 
 def get_meter_model_type(serial_bytes: bytes) -> MeterType:
