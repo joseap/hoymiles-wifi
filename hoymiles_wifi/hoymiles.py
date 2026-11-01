@@ -1,91 +1,5 @@
-"""Hoymiles quirks for inverters and DTU."""
-
-import struct
-from dataclasses import dataclass
-from enum import Enum
-
-from hoymiles_wifi import logger
-from hoymiles_wifi.const import (
-    IS_ENCRYPTED_BIT_INDEX,
-)
-
-
-class InverterType(Enum):
-    """Inverter type."""
-
-    ONE = "1T"
-    TWO = "2T"
-    FOUR = "4T"
-    SIX = "6T"
-
-
-class InverterSeries(Enum):
-    """Inverter series."""
-
-    HM = "HM"
-    HMS = "HMS"
-    HMT = "HMT"
-    SOL_H = "SOL_H"
-
-
-class InverterPower(Enum):
-    """Inverter power."""
-
-    P_100 = "100"
-    P_250 = "250"
-    P_300_350_400 = "300/350/400"
-    P_400 = "400"
-    P_450 = "450"
-    P_400W_500W = "400W/500W"
-    P_500 = "500"
-    P_600_700_800 = "600/700/800"
-    P_1000 = "1000"
-    P_800W_1000W = "800W/1000W"
-    P_1000_1200_1500 = "1000/1200/1500"
-    P_1200_1500 = "1200/1500"
-    P_1600_1800_2000 = "1600/1800/2000"
-    P_2000DW = "2000DW"
-    P_2250 = "2250"
-
-
-power_mapping = {
-    0x1011: InverterPower.P_100,
-    0x1020: InverterPower.P_250,
-    0x1021: InverterPower.P_300_350_400,
-    0x1121: InverterPower.P_300_350_400,
-    0x1125: InverterPower.P_400,
-    0x1403: InverterPower.P_400W_500W,
-    0x1040: InverterPower.P_500,
-    0x1041: InverterPower.P_600_700_800,
-    0x1042: InverterPower.P_600_700_800,
-    0x1141: InverterPower.P_600_700_800,
-    0x1144: InverterPower.P_1000,
-    0x1060: InverterPower.P_1000,
-    0x1061: InverterPower.P_1200_1500,
-    0x1161: InverterPower.P_1000_1200_1500,
-    0x1164: InverterPower.P_1600_1800_2000,
-    0x1400: InverterPower.P_450,
-    0x1412: InverterPower.P_800W_1000W,
-    0x1382: InverterPower.P_2250,
-    0x2821: InverterPower.P_1000,
-    0x1222: InverterPower.P_2000DW,
+    0x7367: DTUType.DTU_PRO,  # DTU-SG (0x7367 = 'sg')
 }
-
-
-class DTUType(Enum):
-    """DTU type."""
-
-    DTU_G100 = "DTU-G100"
-    DTU_W100 = "DTU-W100"
-    DTU_LITE_S = "DTU-Lite-S"
-    DTU_LITE = "DTU-Lite"
-    DTU_PRO = "DTU-PRO"
-    DTU_PRO_S = "DTU-PRO-S"
-    DTUBI = "DTUBI"
-    DTU_W100_LITE_S = "DTU-W100/DTU-Lite-S"
-    DTU_W_LITE = "DTU-WLite"
-    DTU_SLS = "DTU-SLS"
-    DTS_WIFI_G1 = "DTS-WIFI-G1"
 
 
 type_mapping = {
@@ -131,11 +45,11 @@ type_mapping = {
     0x4141: DTUType.DTUBI,
     0x4143: DTUType.DTUBI,
     0x4144: DTUType.DTUBI,
+    0x4145: DTUType.DTUBI,
     0xD030: DTUType.DTU_SLS,
     0x4301: DTUType.DTS_WIFI_G1,
     0x7367: DTUType.DTU_PRO,  # DTU-SG (0x7367 = 'sg')
 }
-
 
 class MeterType(Enum):
     """Meter type."""
@@ -305,6 +219,8 @@ def get_inverter_type(serial_bytes: bytes) -> InverterType:
             inverter_type = InverterType.ONE
         if serial_bytes[1] in [0x10, 0x12]:
             inverter_type = InverterType.TWO
+        if serial_bytes[1] in [0x83]:
+            inverter_type = InverterType.FOUR
     elif serial_bytes[0] == 0x20:
         if serial_bytes[1] in [0x83]:
             inverter_type = InverterType.FOUR
@@ -340,7 +256,6 @@ def get_inverter_series(serial_bytes: bytes) -> InverterSeries:
         series = InverterSeries.HMT
     elif serial_bytes[0] == 0x14:
         series = InverterSeries.HMS
-    elif serial_bytes[0] == 0x28:
         series = InverterSeries.SOL_H
 
     if series is None:
