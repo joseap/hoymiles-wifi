@@ -21,13 +21,59 @@ The library was successfully tested with:
 - Hoymiles HAS-5.0LV-EUG1
 - Hoymiles HYS-4.6LV-EUG1
 - Hoymiles HYT-5.0HV-EUG1
+- Hoymiles HAT-8.0HV-EUG1
 - Solenso H-1000 (not tested for command, only to get data)
 - Solenso DTU_SLS (not tested for command, only to get data)
 
 ## Installation
 
+### Quick install (system-wide or existing environment)
+
+```bash
+pip install hoymiles-wifi
 ```
-$ pip install hoymiles-wifi
+
+### Isolated install with a virtual environment (recommended)
+
+A virtual environment keeps the library and its dependencies isolated from your
+system Python and other projects. Works on Linux, macOS, and Windows.
+
+**Linux / macOS**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install --upgrade pip
+pip install hoymiles-wifi
+```
+
+**Windows (PowerShell)**
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install hoymiles-wifi
+```
+
+**Windows (Command Prompt)**
+
+```cmd
+python -m venv .venv
+.\.venv\Scripts\activate.bat
+python -m pip install --upgrade pip
+pip install hoymiles-wifi
+```
+
+After activation, the `hoymiles-wifi` command is available inside the venv.
+To leave the environment, run `deactivate`.
+
+**Editable install from a cloned source tree** (for development):
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate        # Windows: .\.venv\Scripts\Activate.ps1
+pip install -e .
 ```
 
 ## Usage
@@ -37,7 +83,7 @@ You can integrate the library into your own project, or simply use it in the com
 ## Warning
 
 > [!CAUTION]
-> Please refrain from using the power limitation feature for zero feed-in, as it may lead to damaging the inverter due to excessive writes to the EEPROM.
+> Please refrain from using the persistent percentage power limit (`set-power-limit`) for zero feed-in, as frequent writes may damage the EEPROM. Use `set-power-limit-temporary` instead.
 
 ### Command line:
 
@@ -50,10 +96,13 @@ hoymiles-wifi --host HOST <command> [additional-arguments]
 | get-real-data-new               | DTU and W-series                       | Retrieve real-time data                                          |
 | get-real-data                   | DTU and W-series                       | Retrieve real-time data                                          |
 | get-config                      | DTU and W-series                       | Retrieve configuration information                               |
+| get-grid-profile                | DTU and W-series                       | Read the raw grid-configuration protobuf (`--inverter-serial` required) |
+| get-grid-profile-decoded        | DTU and W-series                       | Read and decode microinverter grid-profile settings (`--inverter-serial` required) |
 | network-info                    | DTU and W-series                       | Retrieve network information                                     |
 | app-information-data            | DTU and W-series                       | Retrieve application information data                            |
 | app-get-hist-power              | DTU and W-series                       | Retrieve historical power data                                   |
 | set-power-limit                 | DTU and W-series                       | Set the power limit of the inverter (0-100%)                     |
+| set-power-limit-temporary       | Supported HMS-W-2T only                 | Set a temporary limit in watts                       |
 | set-wifi                        | DTU and W-series                       | Configure the WiFi network                                       |
 | firmware-update                 | DTU and W-series                       | Update to latest firmware                                        |
 | restart-dtu                     | DTU and W-series                       | Restart the DTU                                                  |
@@ -72,7 +121,9 @@ hoymiles-wifi --host HOST <command> [additional-arguments]
 | get-gateway-network-info        | HAT / HYT / HAS / HYS battery inverter | Get network information for hybrid-inverters                     |
 | get-energy-storage-registry     | HAT / HYT / HAS / HYS battery inverter | Get information about the hybrid-inverter                        |
 | get-energy-storage-data         | HAT / HYT / HAS / HYS battery inverter | Get live data of the hybrid-inverter                             |
+| get-energy-storage-working-mode | HAT / HYT / HAS / HYS battery inverter | Read current working mode and mode-specific settings |
 | set-energy-storage-working-mode | HAT / HYT / HAS / HYS battery inverter | Set the working mode of the hybrid-inverter                      |
+
 
 ### CLI Arguments
 
@@ -85,6 +136,7 @@ The following arguments are available when using the CLI:
 | `--as-json`             | flag | Format output as JSON                             |
 | `--disable-interactive` | flag | Disables interactive prompts                      |
 | `--enc-rand`            | str  | Set inverter specific encryption data             |
+| `--dtu-time-offset`     | int  | Clock offset in seconds (default: 0)              |
 | `--timeout`             | int  | Set custom timeout in seconds                     |
 
 
@@ -101,6 +153,77 @@ The following arguments are only available when using the `--disable-interactive
 | `--peak-meter-power`       | int  | Peak meter power (in W) to set         |
 | `--time-settings`          | str  | See Economic working mode              |
 | `--time-periods`           | str  | See Time of Use working mode           |
+
+### Encryption (enc_rand)
+
+Some DTUs enforce encrypted communication. This is notably the case for devices running firmware v01.x, where encryption is mandatory. On older firmware (v00.x), data could be retrieved without encryption; firmware v01.x enables encryption, so `enc_rand` must be supplied.
+
+If the DTU has been disconnected from the internet for some time, its clock may be out of sync. Encrypted requests containing the current time may then be rejected. Supply the clock difference as `dtu_time_offset` when needed.
+
+> [!NOTE]
+> Whether a DTU uses encryption is determined by a flag in the DTU's application information data. The `--enc-rand` argument is only required when the DTU reports as encrypted.
+
+To obtain the `enc_rand` value, use the `is-encrypted` command:
+
+```bash
+hoymiles-wifi --host HOST is-encrypted
+```
+
+Example output (with `--as-json`):
+
+```json
+{
+  "is_encrypted": true,
+  "dtu_time_offset": -120,
+  "enc_rand": "00112233445566778899aabbccddeeff"
+}
+```
+
+Pass `enc_rand` via `--enc-rand` for encrypted commands. If the DTU clock is out of sync, also pass the measured offset via `--dtu-time-offset`. The offset is the DTU clock minus the host clock in seconds, so a negative value means the DTU is behind the host:
+
+```bash
+hoymiles-wifi --host HOST --enc-rand 00112233445566778899aabbccddeeff --dtu-time-offset -120 get-real-data-new
+```
+
+> [!NOTE]
+> The `enc_rand` value is device-specific. If the DTU is re-paired or reset, re-run `is-encrypted` to fetch the new value.
+
+In Python, `DTU.async_app_information_data()` returns the raw DTU timestamp,
+encryption flag, and `enc_rand`. Calculate the offset from that response and
+set it on the `DTU` instance:
+
+```python
+import asyncio
+import time
+
+from hoymiles_wifi.dtu import DTU
+from hoymiles_wifi.hoymiles import is_encrypted_dtu
+
+async def main():
+    dtu = DTU("10.10.100.254")
+    info = await dtu.async_app_information_data()
+    if info is None:
+        raise RuntimeError("Could not read DTU information")
+    dtu.dtu_time_offset = info.timestamp - round(time.time())
+    dtu.is_encrypted = bool(is_encrypted_dtu(info.dtu_info.dfs))
+    dtu.enc_rand = info.dtu_info.enc_rand
+
+    return await dtu.async_get_real_data_new()
+
+response = asyncio.run(main())
+print(response)
+```
+
+Calculate the offset immediately after receiving the response so it reflects
+the current difference between the two clocks. Refresh it after a DTU restart
+or clock synchronization. The offset stays in memory and is not automatically
+learned by the library.
+
+Negative integers are valid CLI arguments: `--dtu-time-offset -120` and
+`--dtu-time-offset=-120` are equivalent. Positive values mean the DTU is ahead
+of the host. The offset adjusts request timestamps, including power-limit and
+hybrid configuration requests; transaction IDs and request pacing are unchanged.
+Unencrypted app-info discovery continues to use host time.
 
 ### 🔧 BMS Working Modes & Required Parameters
 
@@ -202,7 +325,8 @@ else:
 - `async_network_info()`: Retrieve network information
 - `async_app_information_data()`: Retrieve application information data
 - `async_app_get_hist_power()`: Retrieve historical power data
-- `async_set_power_limit(power_limit)`: Set the power limit of the inverter (0-100%)
+- `async_set_power_limit(power_limit)`: Set the persistent power limit of the inverter (0-100%)
+- `async_set_power_limit_temporary(power_watts)`: Set a temporary watt limit on supported HMS-W-2T devices.
 - `async_set_wifi(wifi_ssid, wifi_password)`: Configure the wifi network
 - `async_firmware_update()`: Update to latest firmware
 - `async_restart_dtu()`: Restart the DTU

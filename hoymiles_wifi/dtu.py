@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import struct
 import time
 from datetime import datetime
@@ -10,14 +11,17 @@ from enum import Enum, IntEnum
 from typing import Any
 
 from crcmod import mkCrcFun
+from google.protobuf.message import DecodeError
 
 from hoymiles_wifi import logger
 from hoymiles_wifi.const import (
     CMD_ACTION_ALARM_LIST,
     CMD_ACTION_DTU_REBOOT,
     CMD_ACTION_DTU_UPGRADE,
+    CMD_ACTION_GRID_FILE_READ,
     CMD_ACTION_INV_REBOOT,
     CMD_ACTION_LIMIT_POWER,
+    CMD_ACTION_LIMIT_POWER_TEMPORARY,
     CMD_ACTION_MI_SHUTDOWN,
     CMD_ACTION_MI_START,
     CMD_ACTION_PERFORMANCE_DATA_MODE,
@@ -25,9 +29,13 @@ from hoymiles_wifi.const import (
     CMD_APP_INFO_DATA_RES_DTO,
     CMD_CLOUD_COMMAND_RES_DTO,
     CMD_COMMAND_RES_DTO,
+    CMD_DEV_CONFIG_FETCH_RES_DTO,
+    CMD_ES_CONFIG_FETCH_RES_DTO,
+    CMD_ES_CONFIG_TYPE,
     CMD_ES_DATA_DTO,
     CMD_ES_REG_RES_DTO,
     CMD_ES_USER_SET_RES_DTO,
+    CMD_ES_WORKING_MODE_DATA_TYPE,
     CMD_GET_CONFIG,
     CMD_GW_INFO_RES_DTO,
     CMD_GW_NET_INFO_RES,
@@ -41,13 +49,27 @@ from hoymiles_wifi.const import (
     DEV_DTU,
     DTU_FIRMWARE_URL_00_01_11,
     DTU_PORT,
+    ES_CONFIG_PAGE_PREFIX_SIZE,
+    GRID_PROFILE_READ_ATTEMPTS,
+    GRID_PROFILE_RETRY_INTERVAL_SECONDS,
+    GRID_PROFILE_RULE_TYPE,
+    MAX_ES_CONFIG_PAGES,
+    MAX_GRID_PROFILE_PAGES,
+    MAX_TEMPORARY_POWER_LIMIT_WATTS,
+    MIN_TEMPORARY_POWER_LIMIT_WATTS,
     NOT_ENCRYPTED_COMMANDS,
     OFFSET,
 )
 from hoymiles_wifi.crypt_util import crypt_data
+from hoymiles_wifi.grid_profile import (
+    decode_grid_profile,
+    get_grid_profile_name,
+    get_grid_profile_version,
+)
 from hoymiles_wifi.hoymiles import (
     BMSWorkingMode,
     DateBean,
+    DecodedGridProfileConfiguration,
     TariffType,
     TimePeriodBean,
     convert_inverter_serial_number,
@@ -60,7 +82,10 @@ from hoymiles_wifi.protobuf import (
     APPHeartbeatPB_pb2,
     APPInfomationData_pb2,
     CommandPB_pb2,
+    CommDevCfg_pb2,
+    DevConfig_pb2,
     ESData_pb2,
+    ESParaSet_pb2,
     ESRegPB_pb2,
     ESUserSet_pb2,
     GetConfig_pb2,
@@ -101,6 +126,7 @@ class DTU:
         is_encrypted: bool = False,
         enc_rand: bytes = b"",
         timeout: int = DEFAULT_TIMEOUT,
+        dtu_time_offset: int = 0,
     ):
         """Initialize DTU class."""
 
@@ -113,6 +139,7 @@ class DTU:
         self.is_encrypted: bool = is_encrypted
         self.enc_rand: bytes = enc_rand
         self.timeout: int = timeout
+        self.dtu_time_offset: int = dtu_time_offset
 
     def get_state(self) -> NetworkState:
         """Get DTU state."""
@@ -126,6 +153,10 @@ class DTU:
             self.state = new_state
             logger.debug(f"DTU is {new_state}")
 
+    def _request_time(self) -> int:
+        """Return the host time adjusted to the DTU clock."""
+        return int(time.time()) + self.dtu_time_offset
+
     async def async_get_real_data(self) -> RealData_pb2.RealDataReqDTO | None:
         """Get real data."""
 
@@ -133,7 +164,7 @@ class DTU:
         request.time_ymd_hms = (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S").encode("utf-8")
         )
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.offset = OFFSET
         request.error_code = 0
 
@@ -152,7 +183,7 @@ class DTU:
             datetime.now().strftime("%Y-%m-%d %H:%M:%S").encode("utf-8")
         )
         request.offset = OFFSET
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.cp = 0
         command = CMD_REAL_RES_DTO
 
@@ -168,6 +199,7 @@ class DTU:
             # Fetch additional data based on the value of response.ap
             for cp in range(1, response.ap):
                 request.cp = cp
+                request.time = self._request_time()
 
                 additional_response = await self.async_send_request(
                     command, request, RealDataNew_pb2.RealDataNewReqDTO
@@ -182,7 +214,7 @@ class DTU:
 
         request = GetConfig_pb2.GetConfigResDTO()
         request.offset = OFFSET
-        request.time = int(time.time()) - 60
+        request.time = self._request_time()
         command = CMD_GET_CONFIG
         return await self.async_send_request(
             command,
@@ -195,7 +227,7 @@ class DTU:
 
         request = NetworkInfo_pb2.NetworkInfoResDTO()
         request.offset = OFFSET
-        request.time = int(time.time())
+        request.time = self._request_time()
         command = CMD_NETWORK_INFO_RES
         return await self.async_send_request(
             command, request, NetworkInfo_pb2.NetworkInfoReqDTO
@@ -204,7 +236,7 @@ class DTU:
     async def async_app_information_data(
         self,
     ) -> APPInfomationData_pb2.APPInfoDataReqDTO:
-        """Get app information data."""
+        """Read unencrypted app information to discover encryption and clock settings."""
         request = APPInfomationData_pb2.APPInfoDataResDTO()
         request.time_ymd_hms = (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S").encode("utf-8")
@@ -226,7 +258,7 @@ class DTU:
         request = AppGetHistPower_pb2.AppGetHistPowerResDTO()
         request.cp = 0
         request.offset = OFFSET
-        request.requested_time = int(time.time())
+        request.requested_time = self._request_time()
         request.requested_day = 0
         command = CMD_APP_GET_HIST_POWER_RES
 
@@ -245,6 +277,7 @@ class DTU:
             # Fetch additional data based on the value of response.ap
             for cp in range(1, response.ap):
                 request.cp = cp
+                request.requested_time = self._request_time()
 
                 additional_response = await self.async_send_request(
                     command,
@@ -259,11 +292,157 @@ class DTU:
 
         return combined_response if combined_response.ByteSize() > 0 else None
 
+    async def async_get_grid_profile(
+        self, inverter_serial: str
+    ) -> DevConfig_pb2.DevConfigFetchReqDTO | None:
+        """Read a microinverter's grid profile without changing its settings.
+
+        Return the validated configuration protobuf with its binary data intact.
+        """
+        inverter_number = convert_inverter_serial_number(inverter_serial)
+        app_info = await self.async_app_information_data()
+        if app_info is None or not app_info.dtu_serial_number:
+            return None
+        inverter_info = next(
+            (
+                info
+                for info in app_info.pv_info
+                if info.pv_serial_number == inverter_number
+            ),
+            None,
+        )
+        if inverter_info is None:
+            logger.debug("Inverter %s not found in app information", inverter_serial)
+            return None
+        inverter_serial = inverter_serial.upper()
+        transaction_id = int(time.time())
+        request = CommandPB_pb2.CommandResDTO(
+            time=self._request_time(),
+            action=CMD_ACTION_GRID_FILE_READ,
+            dev_kind=DEV_DTU,
+            package_nub=1,
+            tid=transaction_id,
+            data="0",
+            mi_to_sn=[inverter_number],
+        )
+        acknowledgement = await self.async_send_request(
+            CMD_COMMAND_RES_DTO, request, CommandPB_pb2.CommandReqDTO
+        )
+        if (
+            acknowledgement is None
+            or acknowledgement.err_code != 0
+            or acknowledgement.action != CMD_ACTION_GRID_FILE_READ
+            or acknowledgement.tid != transaction_id
+            or acknowledgement.dtu_sn.upper() != app_info.dtu_serial_number.upper()
+        ):
+            logger.debug(
+                "DTU did not acknowledge grid profile read for %s", inverter_serial
+            )
+            return None
+        return await self._async_fetch_grid_profile(
+            app_info.dtu_serial_number, inverter_serial, transaction_id
+        )
+
+    async def async_get_grid_profile_decoded(
+        self, inverter_serial: str
+    ) -> DecodedGridProfileConfiguration | None:
+        """Read and decode the big-endian grid-profile payload returned locally."""
+        response = await self.async_get_grid_profile(inverter_serial)
+        if response is None:
+            return None
+        profile_code = None
+        profile_version = None
+        decoded = None
+        if len(response.data) >= 4:
+            profile_code = int.from_bytes(response.data[:2], "big")
+            profile_version = int.from_bytes(response.data[2:4], "big")
+            decoded = decode_grid_profile(response.data, profile_code, profile_version)
+        return DecodedGridProfileConfiguration(
+            dtu_serial_number=response.dtu_sn,
+            inverter_serial_number=response.dev_sn,
+            grid_profile_code=profile_code,
+            grid_profile=profile_version,
+            rule_id=response.rule_id,
+            data_hex=response.data.hex(),
+            configuration_hex=response.cfg_data.hex(),
+            grid_profile_name=get_grid_profile_name(profile_code),
+            grid_profile_version=(
+                get_grid_profile_version(profile_version)
+                if profile_version is not None
+                else None
+            ),
+            decoded=decoded,
+        )
+
+    async def _async_fetch_grid_profile(
+        self, dtu_serial: str, inverter_serial: str, transaction_id: int
+    ) -> DevConfig_pb2.DevConfigFetchReqDTO | None:
+        """Collect and validate the complete binary grid-configuration response."""
+        combined = None
+        total_pages = None
+        for page in range(MAX_GRID_PROFILE_PAGES):
+            request = DevConfig_pb2.DevConfigFetchResDTO(
+                response_time=self._request_time(),
+                transaction_id=transaction_id,
+                dtu_sn=dtu_serial,
+                dev_sn=inverter_serial,
+                current_package=page,
+                rule_type=GRID_PROFILE_RULE_TYPE,
+            )
+            for attempt in range(GRID_PROFILE_READ_ATTEMPTS):
+                response = await self.async_send_request(
+                    CMD_DEV_CONFIG_FETCH_RES_DTO,
+                    request,
+                    DevConfig_pb2.DevConfigFetchReqDTO,
+                )
+                if response is not None:
+                    break
+                if page != 0 or attempt + 1 == GRID_PROFILE_READ_ATTEMPTS:
+                    return None
+                await asyncio.sleep(GRID_PROFILE_RETRY_INTERVAL_SECONDS)
+                request.response_time = self._request_time()
+            if (
+                response.transaction_id != transaction_id
+                or response.dtu_sn.upper() != dtu_serial.upper()
+                or response.dev_sn.upper() != inverter_serial.upper()
+                or response.rule_type != GRID_PROFILE_RULE_TYPE
+                or response.current_package != page
+                or not 1 <= response.total_packages <= MAX_GRID_PROFILE_PAGES
+                or (total_pages is not None and response.total_packages != total_pages)
+                or not response.data
+                or (
+                    combined is not None
+                    and (
+                        response.rule_id != combined.rule_id
+                        or response.crc != combined.crc
+                        or response.cfg_crc != combined.cfg_crc
+                    )
+                )
+            ):
+                logger.debug("Invalid grid profile response on page %s", page)
+                return None
+            total_pages = response.total_packages
+            if combined is None:
+                combined = DevConfig_pb2.DevConfigFetchReqDTO()
+                combined.CopyFrom(response)
+            else:
+                combined.data += response.data
+                combined.cfg_data += response.cfg_data
+            if page + 1 == total_pages:
+                break
+        crc16 = mkCrcFun(0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000)
+        if crc16(combined.data) != combined.crc or (
+            combined.cfg_data and crc16(combined.cfg_data) != combined.cfg_crc
+        ):
+            logger.debug("Grid profile configuration checksum mismatch")
+            return None
+        return combined
+
     async def async_set_power_limit(
         self,
         power_limit: int,
     ) -> CommandPB_pb2.CommandReqDTO | None:
-        """Set power limit."""
+        """Set the persistent power limit in percent (action 8)."""
         if power_limit < 0 or power_limit > 100:
             logger.error("Error. Invalid power limit!")
             return
@@ -271,7 +450,7 @@ class DTU:
         power_limit = power_limit * 10
 
         request = CommandPB_pb2.CommandResDTO()
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.action = CMD_ACTION_LIMIT_POWER
         request.package_nub = 1
         request.tid = int(time.time())
@@ -281,6 +460,33 @@ class DTU:
 
         return await self.async_send_request(
             command, request, CommandPB_pb2.CommandReqDTO
+        )
+
+    async def async_set_power_limit_temporary(
+        self,
+        power_watts: float,
+    ) -> CommandPB_pb2.CommandReqDTO | None:
+        """Set a runtime watt limit on supported HMS-W devices (requires firmare V01.01.01 or above)."""
+        if (
+            isinstance(power_watts, bool)
+            or not isinstance(power_watts, (int, float))
+            or not math.isfinite(power_watts)
+            or not MIN_TEMPORARY_POWER_LIMIT_WATTS
+            <= power_watts
+            <= MAX_TEMPORARY_POWER_LIMIT_WATTS
+        ):
+            logger.error("Invalid temporary power limit; expected 0.1–3276.7 W")
+            return None
+
+        scaled_watts = math.floor(power_watts * 10 + 0.5)
+        request = CommandPB_pb2.CommandResDTO()
+        request.time = self._request_time()
+        request.action = CMD_ACTION_LIMIT_POWER_TEMPORARY
+        request.package_nub = 1
+        request.tid = int(time.time())
+        request.data = f"S:1,P:{scaled_watts}\r"
+        return await self.async_send_request(
+            CMD_COMMAND_RES_DTO, request, CommandPB_pb2.CommandReqDTO
         )
 
     async def async_set_wifi(
@@ -296,7 +502,7 @@ class DTU:
 
         request = initialize_set_config(get_config_req)
 
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.offset = OFFSET
         request.app_page = 1
         request.netmode_select = NetmodeSelect.WIFI
@@ -408,7 +614,7 @@ class DTU:
             datetime.now().strftime("%Y-%m-%d %H:%M:%S").encode("utf-8")
         )
         request.offset = OFFSET
-        request.time = int(time.time())
+        request.time = self._request_time()
         command = CMD_APP_INFO_DATA_RES_DTO
         return await self.async_send_request(
             command, request, InfomationData_pb2.InfoDataReqDTO
@@ -422,7 +628,7 @@ class DTU:
             datetime.now().strftime("%Y-%m-%d %H:%M:%S").encode("utf-8")
         )
         request.offset = OFFSET
-        request.time = int(time.time())
+        request.time = self._request_time()
 
         command = CMD_HB_RES_DTO
         return await self.async_send_request(
@@ -449,7 +655,7 @@ class DTU:
         """Enable performance data mode."""
 
         request = CommandPB_pb2.CommandResDTO()
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.action = CMD_ACTION_PERFORMANCE_DATA_MODE
         request.package_nub = 1
 
@@ -462,7 +668,7 @@ class DTU:
         """Get gateway info."""
 
         request = GWInfo_pb2.GWInfoResDTO()
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.offset = OFFSET
 
         command = CMD_GW_INFO_RES_DTO
@@ -481,7 +687,7 @@ class DTU:
         """Get gateway network info."""
 
         request = GWNetInfo_pb2.GWNetInfoRes()
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.offset = OFFSET
 
         command = CMD_GW_NET_INFO_RES
@@ -501,7 +707,7 @@ class DTU:
         """Get energy storage registry."""
 
         request = ESRegPB_pb2.ESRegResDTO()
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.time_ymd_hms = (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S").encode("utf-8")
         )
@@ -525,7 +731,7 @@ class DTU:
         """Get energy storage registry."""
 
         request = ESData_pb2.ESDataResDTO()
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.time_ymd_hms = (
             datetime.now().strftime("%Y-%m-%d %H:%M:%S").encode("utf-8")
         )
@@ -544,6 +750,67 @@ class DTU:
             number=1,
         )
 
+    async def async_get_energy_storage_working_mode(
+        self, dtu_serial_number: int, inverter_serial_number: int
+    ) -> ESParaSet_pb2.ESParaSetBO | None:
+        """Read hybrid working mode and settings through the configuration protocol.
+
+        Return the complete configuration; ``emspara.mode`` uses BMSWorkingMode
+        values. Mode-specific settings retain their raw protocol units. Return
+        None when any page is missing, inconsistent, or cannot be decoded.
+        """
+        payload = bytearray()
+        total_pages = None
+        for page in range(MAX_ES_CONFIG_PAGES):
+            request = CommDevCfg_pb2.CommDevCfgFetchResDTO(
+                time=self._request_time(),
+                tid=int(time.time()),
+                cp=page,
+                type=CMD_ES_CONFIG_TYPE,
+                data_type=CMD_ES_WORKING_MODE_DATA_TYPE,
+            )
+            response = await self.async_send_request(
+                CMD_ES_CONFIG_FETCH_RES_DTO,
+                request,
+                CommDevCfg_pb2.CommDevCfgFetchReqDTO,
+                is_extended_format=True,
+                dtu_serial_number=dtu_serial_number,
+                number=1,
+            )
+            if response is None:
+                return None
+            if (
+                response.cp != page
+                or not 1 <= response.ap <= MAX_ES_CONFIG_PAGES
+                or (total_pages is not None and response.ap != total_pages)
+                or response.sn != inverter_serial_number
+                or response.type != CMD_ES_CONFIG_TYPE
+                or response.data_type != CMD_ES_WORKING_MODE_DATA_TYPE
+                or len(response.data) <= ES_CONFIG_PAGE_PREFIX_SIZE
+                or int.from_bytes(response.data[:ES_CONFIG_PAGE_PREFIX_SIZE], "big")
+                != len(response.data) - ES_CONFIG_PAGE_PREFIX_SIZE
+                or mkCrcFun(0x18005, rev=True, initCrc=0xFFFF, xorOut=0x0000)(
+                    response.data
+                )
+                != response.crc
+            ):
+                logger.debug("Invalid energy storage configuration page %s", page)
+                return None
+            total_pages = response.ap
+            payload.extend(response.data[ES_CONFIG_PAGE_PREFIX_SIZE:])
+            if page + 1 == total_pages:
+                break
+
+        try:
+            configuration = ESParaSet_pb2.ESParaSetBO.FromString(bytes(payload))
+        except DecodeError:
+            logger.debug("Unable to decode energy storage working mode configuration")
+            return None
+        if not configuration.HasField("emspara") or configuration.emspara.mode == 0:
+            logger.debug("Energy storage configuration contains no working mode")
+            return None
+        return configuration
+
     async def async_set_energy_storage_working_mode(
         self,
         dtu_serial_number: int,
@@ -559,7 +826,7 @@ class DTU:
         """Set energy storage working mode."""
 
         request = ESUserSet_pb2.ESUserSetPutResDTO()
-        request.time = int(time.time())
+        request.time = self._request_time()
         request.tid = int(time.time())
         request.serial_number.extend([inverter_serial_number])
         request.mode = bms_working_mode.value

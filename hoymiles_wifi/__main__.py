@@ -8,7 +8,9 @@ import json
 import logging
 import os
 import sys
+import time
 from dataclasses import asdict, dataclass, is_dataclass
+from getpass import getpass
 from pprint import pprint
 
 from google.protobuf.json_format import MessageToDict, MessageToJson
@@ -22,6 +24,7 @@ from hoymiles_wifi.dtu import DTU
 from hoymiles_wifi.hoymiles import (
     BMSWorkingMode,
     DateBean,
+    DecodedGridProfileConfiguration,
     TimePeriodBean,
     generate_dtu_version_string,
     generate_inverter_serial_number,
@@ -37,6 +40,7 @@ from hoymiles_wifi.protobuf import (
     APPHeartbeatPB_pb2,
     APPInfomationData_pb2,
     CommandPB_pb2,
+    DevConfig_pb2,
     ESData_pb2,
     ESRegPB_pb2,
     ESUserSet_pb2,
@@ -128,6 +132,20 @@ async def async_app_get_hist_power(
     return await dtu.async_app_get_hist_power()
 
 
+async def async_get_grid_profile(
+    dtu: DTU, inverter_serial: str
+) -> DevConfig_pb2.DevConfigFetchReqDTO | None:
+    """Return the selected microinverter's raw grid-configuration protobuf."""
+    return await dtu.async_get_grid_profile(inverter_serial)
+
+
+async def async_get_grid_profile_decoded(
+    dtu: DTU, inverter_serial: str
+) -> DecodedGridProfileConfiguration | None:
+    """Read and decode the selected microinverter's grid profile."""
+    return await dtu.async_get_grid_profile_decoded(inverter_serial)
+
+
 async def async_set_power_limit(
     dtu: DTU,
     power_limit: int = -1,
@@ -167,16 +185,42 @@ async def async_set_power_limit(
     return await dtu.async_set_power_limit(power_limit)
 
 
+async def async_set_power_limit_temporary(
+    dtu: DTU,
+    power_watts: float | None = None,
+    interactive_mode: bool = True,
+) -> CommandPB_pb2.CommandReqDTO | None:
+    """Set a temporary watt limit on supported HMS-W-2T inverters."""
+    if interactive_mode:
+        power_watts = float(input("Enter the temporary power limit (0.1–3276.7 W): "))
+    if power_watts is None:
+        print("Error. Supply --power-limit-watts.")  # noqa: T201
+        return None
+    return await dtu.async_set_power_limit_temporary(power_watts)
+
+
+def prompt_wifi_password() -> str:
+    """Prompt for a WiFi password and confirm it."""
+    while True:
+        password = getpass("Enter the new WiFi password: ")
+        confirmation = getpass("Confirm the new WiFi password: ")
+
+        if password == confirmation:
+            return password
+
+        print("Passwords do not match. Please try again.")  # noqa: T201
+
+
 async def async_set_wifi(dtu: DTU) -> CommandPB_pb2.CommandResDTO | None:
     """Set the wifi SSID and password of the inverter asynchronously."""
-
     wifi_ssid = input("Enter the new wifi SSID: ").strip()
-    wifi_password = input("Enter the new wifi password: ").strip()
+    wifi_password = prompt_wifi_password()
+
     print(f'Setting wifi to "{wifi_ssid}"')  # noqa: T201
-    print(f'Setting wifi password to "{wifi_password}"')  # noqa: T201
-    cont = input("Are you sure? (y/n): ")
-    if cont != "y":
+
+    if input("Are you sure? (y/n): ").strip().lower() != "y":
         return None
+
     return await dtu.async_set_wifi(wifi_ssid, wifi_password)
 
 
@@ -396,6 +440,29 @@ async def async_get_energy_storage_data(
         if storage_data is not None:
             responses.append(storage_data)
 
+    return responses
+
+
+async def async_get_energy_storage_working_mode(dtu: DTU) -> dict | None:
+    """Read working-mode settings for each registered hybrid inverter."""
+    gateway_info = await dtu.async_get_gateway_info()
+    if gateway_info is None:
+        return None
+    registry = await dtu.async_get_energy_storage_registry(
+        dtu_serial_number=gateway_info.serial_number
+    )
+    if registry is None:
+        return None
+    responses = {}
+    for inverter in registry.inverters:
+        configuration = await dtu.async_get_energy_storage_working_mode(
+            dtu_serial_number=gateway_info.serial_number,
+            inverter_serial_number=inverter.serial_number,
+        )
+        if configuration is not None:
+            responses[str(inverter.serial_number)] = MessageToDict(
+                configuration, preserving_proto_field_name=True
+            )
     return responses
 
 
@@ -678,21 +745,19 @@ async def async_set_energy_storage_working_mode_interactive(
 
 
 async def async_is_encrypted(dtu: DTU):
-    """Check if the DTU is using encrypted communication."""
+    """Check encryption and report the DTU clock offset."""
+    app_info = await dtu.async_app_information_data()
+    if app_info is None:
+        return None
 
-    app_information_data = await dtu.async_app_information_data()
-
-    is_encrypted_info = {}
-
-    if app_information_data and app_information_data.dtu_info.dfs:
-        if is_encrypted_dtu(app_information_data.dtu_info.dfs):
-            is_encrypted_info["is_encrypted"] = True
-            is_encrypted_info["enc_rand"] = app_information_data.dtu_info.enc_rand.hex()
-
-    else:
-        is_encrypted_info["is_encrypted"] = False
-
-    return is_encrypted_info
+    is_encrypted = bool(is_encrypted_dtu(app_info.dtu_info.dfs))
+    result = {
+        "is_encrypted": is_encrypted,
+        "dtu_time_offset": app_info.timestamp - round(time.time()),
+    }
+    if is_encrypted:
+        result["enc_rand"] = app_info.dtu_info.enc_rand.hex()
+    return result
 
 
 def print_invalid_command(command: str) -> None:
@@ -700,6 +765,40 @@ def print_invalid_command(command: str) -> None:
 
     print(f"Invalid command: {command}")  # noqa: T201
     sys.exit(1)
+
+
+async def _async_execute_command(dtu: DTU, args: argparse.Namespace, command_func):
+    """Execute a CLI command with its supported arguments."""
+    if args.command in {"get-grid-profile", "get-grid-profile-decoded"}:
+        response = await command_func(dtu, args.inverter_serial)
+    elif args.command == "set-power-limit":
+        kwargs = {}
+        kwargs["power_limit"] = args.power_limit
+        kwargs["interactive_mode"] = not args.disable_interactive
+        response = await command_func(dtu, **kwargs)
+    elif args.command == "set-power-limit-temporary":
+        response = await command_func(
+            dtu,
+            power_watts=args.power_limit_watts,
+            interactive_mode=not args.disable_interactive,
+        )
+    elif args.command == "set-energy-storage-working-mode":
+        kwargs = {}
+        kwargs["interactive_mode"] = not args.disable_interactive
+        kwargs["bms_working_mode"] = BMSWorkingMode(args.bms_working_mode)
+        kwargs["inverter_serial_number"] = args.inverter_serial_number
+        kwargs["rev_soc"] = args.rev_soc
+        kwargs["time_settings_str"] = args.time_settings
+        kwargs["max_power"] = args.max_power
+        kwargs["peak_soc"] = args.peak_soc
+        kwargs["peak_meter_power"] = args.peak_meter_power
+        kwargs["time_periods_str"] = args.time_periods
+
+        response = await command_func(dtu, **kwargs)
+    else:
+        response = await command_func(dtu)
+
+    return response
 
 
 async def main() -> None:
@@ -733,6 +832,13 @@ async def main() -> None:
         default=None,
         choices=range(0, 101),
         help="Power limit to set (0...100).",
+    )
+
+    parser.add_argument(
+        "--power-limit-watts",
+        type=float,
+        default=None,
+        help="Temporary power limit in watts (0.1–3276.7, supported HMS-W-2T only).",
     )
 
     parser.add_argument(
@@ -802,6 +908,13 @@ async def main() -> None:
         help="The inverter specific random string used for encryption, see command: is-encrypted",
     )
 
+    parser.add_argument(
+        "--dtu-time-offset",
+        type=int,
+        default=0,
+        help="Signed seconds to add to request timestamps, see command: is-encrypted",
+    )
+
     parser.add_argument("--timeout", type=int, default=None, help="Custom timeout")
 
     parser.add_argument(
@@ -811,10 +924,13 @@ async def main() -> None:
             "get-real-data-new",
             "get-real-data",
             "get-config",
+            "get-grid-profile",
+            "get-grid-profile-decoded",
             "network-info",
             "app-information-data",
             "app-get-hist-power",
             "set-power-limit",
+            "set-power-limit-temporary",
             "set-wifi",
             "firmware-update",
             "restart-dtu",
@@ -832,23 +948,32 @@ async def main() -> None:
             "get-energy-storage-data",
             "get-gateway-info",
             "get-gateway-network-info",
+            "get-energy-storage-working-mode",
             "set-energy-storage-working-mode",
             "is-encrypted",
         ],
         help="Command to execute",
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--inverter-serial",
+        help="Hexadecimal microinverter serial number for grid-profile commands",
+    )
 
-    if args.enc_rand:
-        dtu = DTU(
-            args.host,
-            args.local_addr,
-            is_encrypted=True,
-            enc_rand=bytes.fromhex(args.enc_rand),
-        )
-    else:
-        dtu = DTU(args.host, args.local_addr)
+    args = parser.parse_args()
+    if (
+        args.command in {"get-grid-profile", "get-grid-profile-decoded"}
+        and not args.inverter_serial
+    ):
+        parser.error(f"--inverter-serial is required for {args.command}")
+
+    dtu = DTU(
+        args.host,
+        args.local_addr,
+        is_encrypted=bool(args.enc_rand),
+        enc_rand=bytes.fromhex(args.enc_rand) if args.enc_rand else b"",
+        dtu_time_offset=args.dtu_time_offset,
+    )
 
     if args.timeout:
         dtu.timeout = args.timeout
@@ -858,10 +983,13 @@ async def main() -> None:
         "get-real-data-new": async_get_real_data_new,
         "get-real-data": async_get_real_data,
         "get-config": async_get_config,
+        "get-grid-profile": async_get_grid_profile,
+        "get-grid-profile-decoded": async_get_grid_profile_decoded,
         "network-info": async_network_info,
         "app-information-data": async_app_information_data,
         "app-get-hist-power": async_app_get_hist_power,
         "set-power-limit": async_set_power_limit,
+        "set-power-limit-temporary": async_set_power_limit_temporary,
         "set-wifi": async_set_wifi,
         "firmware-update": async_firmware_update,
         "restart-dtu": async_restart_dtu,
@@ -879,31 +1007,13 @@ async def main() -> None:
         "get-gateway-network-info": async_get_gateway_network_info,
         "get-energy-storage-registry": async_get_energy_storage_registry,
         "get-energy-storage-data": async_get_energy_storage_data,
+        "get-energy-storage-working-mode": async_get_energy_storage_working_mode,
         "set-energy-storage-working-mode": async_set_energy_storage_working_mode,
         "is-encrypted": async_is_encrypted,
     }
 
     command_func = switch.get(args.command, print_invalid_command)
-    if args.command == "set-power-limit":
-        kwargs = {}
-        kwargs["power_limit"] = args.power_limit
-        kwargs["interactive_mode"] = not args.disable_interactive
-        response = await command_func(dtu, **kwargs)
-    elif args.command == "set-energy-storage-working-mode":
-        kwargs = {}
-        kwargs["interactive_mode"] = not args.disable_interactive
-        kwargs["bms_working_mode"] = BMSWorkingMode(args.bms_working_mode)
-        kwargs["inverter_serial_number"] = args.inverter_serial_number
-        kwargs["rev_soc"] = args.rev_soc
-        kwargs["time_settings_str"] = args.time_settings
-        kwargs["max_power"] = args.max_power
-        kwargs["peak_soc"] = args.peak_soc
-        kwargs["peak_meter_power"] = args.peak_meter_power
-        kwargs["time_periods_str"] = args.time_periods
-
-        response = await command_func(dtu, **kwargs)
-    else:
-        response = await command_func(dtu)
+    response = await _async_execute_command(dtu, args, command_func)
 
     if response:
         if args.as_json:

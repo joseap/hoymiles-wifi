@@ -8,6 +8,23 @@ from hoymiles_wifi import logger
 from hoymiles_wifi.const import (
     IS_ENCRYPTED_BIT_INDEX,
 )
+from hoymiles_wifi.grid_profile import DecodedGridProfile
+
+
+@dataclass(frozen=True)
+class DecodedGridProfileConfiguration:
+    """Grid configuration with interpreted profile identifiers and settings."""
+
+    dtu_serial_number: str
+    inverter_serial_number: str
+    grid_profile_code: int | None
+    grid_profile: int | None
+    rule_id: int
+    data_hex: str
+    configuration_hex: str
+    grid_profile_name: str | None
+    grid_profile_version: str | None
+    decoded: DecodedGridProfile | None
 
 
 class InverterType(Enum):
@@ -65,10 +82,12 @@ power_mapping = {
     0x1161: InverterPower.P_1000_1200_1500,
     0x1164: InverterPower.P_1600_1800_2000,
     0x1400: InverterPower.P_450,
+    0x1410: InverterPower.P_1000,
     0x1412: InverterPower.P_800W_1000W,
     0x1382: InverterPower.P_2250,
     0x2821: InverterPower.P_1000,
     0x1222: InverterPower.P_2000DW,
+    0x1422: InverterPower.P_1600_1800_2000,
 }
 
 
@@ -131,6 +150,7 @@ type_mapping = {
     0x4141: DTUType.DTUBI,
     0x4143: DTUType.DTUBI,
     0x4144: DTUType.DTUBI,
+    0x4145: DTUType.DTUBI,
     0xD030: DTUType.DTU_SLS,
     0x4301: DTUType.DTS_WIFI_G1,
 }
@@ -304,6 +324,8 @@ def get_inverter_type(serial_bytes: bytes) -> InverterType:
             inverter_type = InverterType.ONE
         if serial_bytes[1] in [0x10, 0x12]:
             inverter_type = InverterType.TWO
+        if serial_bytes[1] in [0x22]:
+            inverter_type = InverterType.FOUR
     elif serial_bytes[0] == 0x28:
         if serial_bytes[1] in [0x21]:
             inverter_type = InverterType.TWO
