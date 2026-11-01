@@ -153,6 +153,7 @@ type_mapping = {
     0x4145: DTUType.DTUBI,
     0xD030: DTUType.DTU_SLS,
     0x4301: DTUType.DTS_WIFI_G1,
+    0x7367: DTUType.DTU_PRO,  # DTU-SG (0x7367 = 'sg')
 }
 
 
@@ -326,6 +327,9 @@ def get_inverter_type(serial_bytes: bytes) -> InverterType:
             inverter_type = InverterType.TWO
         if serial_bytes[1] in [0x22]:
             inverter_type = InverterType.FOUR
+    elif serial_bytes[0] == 0x20:
+        if serial_bytes[1] in [0x83]:
+            inverter_type = InverterType.FOUR
     elif serial_bytes[0] == 0x28:
         if serial_bytes[1] in [0x21]:
             inverter_type = InverterType.TWO
@@ -358,6 +362,9 @@ def get_inverter_series(serial_bytes: bytes) -> InverterSeries:
         series = InverterSeries.HMT
     elif serial_bytes[0] == 0x14:
         series = InverterSeries.HMS
+    elif serial_bytes[0] == 0x20:
+        if serial_bytes[1] in [0x83]:
+            inverter_type = InverterType.FOUR
     elif serial_bytes[0] == 0x28:
         series = InverterSeries.SOL_H
 
