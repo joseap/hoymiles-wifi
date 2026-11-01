@@ -8,23 +8,6 @@ from hoymiles_wifi import logger
 from hoymiles_wifi.const import (
     IS_ENCRYPTED_BIT_INDEX,
 )
-from hoymiles_wifi.grid_profile import DecodedGridProfile
-
-
-@dataclass(frozen=True)
-class DecodedGridProfileConfiguration:
-    """Grid configuration with interpreted profile identifiers and settings."""
-
-    dtu_serial_number: str
-    inverter_serial_number: str
-    grid_profile_code: int | None
-    grid_profile: int | None
-    rule_id: int
-    data_hex: str
-    configuration_hex: str
-    grid_profile_name: str | None
-    grid_profile_version: str | None
-    decoded: DecodedGridProfile | None
 
 
 class InverterType(Enum):
@@ -82,12 +65,10 @@ power_mapping = {
     0x1161: InverterPower.P_1000_1200_1500,
     0x1164: InverterPower.P_1600_1800_2000,
     0x1400: InverterPower.P_450,
-    0x1410: InverterPower.P_1000,
     0x1412: InverterPower.P_800W_1000W,
     0x1382: InverterPower.P_2250,
     0x2821: InverterPower.P_1000,
     0x1222: InverterPower.P_2000DW,
-    0x1422: InverterPower.P_1600_1800_2000,
 }
 
 
@@ -150,7 +131,6 @@ type_mapping = {
     0x4141: DTUType.DTUBI,
     0x4143: DTUType.DTUBI,
     0x4144: DTUType.DTUBI,
-    0x4145: DTUType.DTUBI,
     0xD030: DTUType.DTU_SLS,
     0x4301: DTUType.DTS_WIFI_G1,
     0x7367: DTUType.DTU_PRO,  # DTU-SG (0x7367 = 'sg')
@@ -325,8 +305,6 @@ def get_inverter_type(serial_bytes: bytes) -> InverterType:
             inverter_type = InverterType.ONE
         if serial_bytes[1] in [0x10, 0x12]:
             inverter_type = InverterType.TWO
-        if serial_bytes[1] in [0x22]:
-            inverter_type = InverterType.FOUR
     elif serial_bytes[0] == 0x20:
         if serial_bytes[1] in [0x83]:
             inverter_type = InverterType.FOUR
@@ -362,9 +340,6 @@ def get_inverter_series(serial_bytes: bytes) -> InverterSeries:
         series = InverterSeries.HMT
     elif serial_bytes[0] == 0x14:
         series = InverterSeries.HMS
-    elif serial_bytes[0] == 0x20:
-        if serial_bytes[1] in [0x83]:
-            inverter_type = InverterType.FOUR
     elif serial_bytes[0] == 0x28:
         series = InverterSeries.SOL_H
 
@@ -427,40 +402,20 @@ def get_dtu_model_type(serial_bytes: bytes) -> DTUType:
 
 
 def get_dtu_model_name(serial_number: str) -> str:
-    """Get DTU model name while suppressing noisy errors for unknown DTUs."""
+    """Get DTU model name."""
 
-    if not serial_number:
-        logger.debug("DTU serial number missing; returning 'Unknown'")
-        return "Unknown"
+    if serial_number[-1:] == "J":
+        serial_number = serial_number[:-1]
 
-    normalized_serial = (
-        serial_number[:-1] if serial_number.endswith("J") else serial_number
-    )
-
-    try:
-        serial_bytes = bytes.fromhex(normalized_serial)
-    except ValueError as err:
-        logger.debug(
-            "DTU serial %s is not a valid hex string; returning 'Unknown' (%s)",
-            serial_number,
-            err,
-        )
-        return "Unknown"
+    serial_bytes = bytes.fromhex(serial_number)
 
     try:
         dtu_type = get_dtu_model_type(serial_bytes)
-    except ValueError as err:
-        logger.debug(
-            "Unknown DTU prefix %s; returning 'Unknown' (%s)",
-            serial_bytes[:2],
-            err,
-        )
+    except Exception as e:
+        logger.error(e)
         return "Unknown"
-    except Exception as err:  # pragma: no cover - defensive fallback
-        logger.error("Unexpected error while decoding DTU %s: %s", serial_number, err)
-        return "Unknown"
-
-    return dtu_type.value
+    else:
+        return dtu_type.value
 
 
 def get_meter_model_type(serial_bytes: bytes) -> MeterType:
