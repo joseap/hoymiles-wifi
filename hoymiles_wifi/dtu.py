@@ -921,17 +921,30 @@ class DTU:
                     logger.error("Error. Check power values for Time of Use!")
                     return
 
+                # Check if discharge is disabled (cloud behavior: 00:00-00:00 with 0% power = disabled)
+                discharge_disabled = (
+                    time_period.discharge_power == 0
+                    and time_period.discharge_time_from == "00:00"
+                    and time_period.discharge_time_to == "00:00"
+                )
+
                 time_of_use = ESUserSet_pb2.TimeOfUseSetMO()
                 time_of_use.chrg_tr = encode_date_time_range(
                     time_period.charge_time_from, time_period.charge_time_to, ":"
                 )
-                time_of_use.dischrg_tr = encode_date_time_range(
-                    time_period.discharge_time_from, time_period.discharge_time_to, ":"
-                )
                 time_of_use.chrg_pwr = time_period.charge_power
-                time_of_use.dischrg_pwr = time_period.discharge_power
                 time_of_use.max_soc = time_period.max_soc
-                time_of_use.min_soc = time_period.min_soc
+
+                if not discharge_disabled:
+                    time_of_use.dischrg_tr = encode_date_time_range(
+                        time_period.discharge_time_from, time_period.discharge_time_to, ":"
+                    )
+                    time_of_use.dischrg_pwr = time_period.discharge_power
+                    time_of_use.min_soc = time_period.min_soc
+                else:
+                    # Explicitly set discharge power to 0 and keep min_soc as reserve
+                    time_of_use.dischrg_pwr = 0
+                    time_of_use.min_soc = time_period.min_soc
 
                 request.tou.extend([time_of_use])
 
